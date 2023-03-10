@@ -1,0 +1,87 @@
+---
+include:
+  - local: /templates/resources.yml
+
+# Note: Variable expansion inside of "variables" blocks occur within the context of the
+# YAML file and not within a shell. Since we want our scripts to be evaluated during
+# script execution we need to escape variables with the double dollar-sign (`$$`).
+#
+# Variable expansion: https://docs.gitlab.com/ee/ci/variables/where_variables_can_be_used.html
+
+# To execute "ci_init" use: `echo "$ci_init" > ci_init && source ci_init && rm ci_init`.
+# When executed this command will generate resource files in the `.ci-helper` directory.
+# There are two supported resource types: "script" and "function". Script resources are
+# marked as executable and added to the path. Function resources are "sourced" making any
+# bash functions available for use.
+#
+# See `/compile-resources` for details on what resources are available.
+
+variables:
+  AWS_DEFAULT_REGION: us-east-1
+  ci_init: |
+    set -e  # Causes job failure when any command fails
+
+    function unpack_resources {
+        for env in $$(compgen -e); do
+            # Need to use a variable that exists for all embedded resources
+            if [[ $$env =~ ^__GCH_TYPE_(.*) ]]; then
+                local name=$${BASH_REMATCH[1]}
+                local type_var="__GCH_TYPE_$${name}"
+                local filename_var="__GCH_FILENAME_$${name}"
+                local content_var="__GCH_CONTENT_$${name}"
+
+                local type=$${!type_var}
+                local filename=$${!filename_var:-$$name}
+                local path=".ci-helper/$${type}s/$$filename"
+
+                if [[ $$type != script && $$type != function ]]; then
+                    echo "Unsupported type: $$type" >&2
+                    return 1
+                fi
+
+                # Requires that the path directory exists
+                echo "$${!content_var}" > $$path
+
+                if [[ $$type == script ]]; then
+                    chmod +x $$path
+                fi
+
+                # Clear `__GCH_*` environmental variables. This cleans up the environment
+                # variable list and additionally avoids re-processing.
+                unset $$type_var $$filename_var $$content_var
+            fi
+        done
+    }
+
+    # Modifications that only persist in the current shell. Note: `after_script` uses a
+    # separate shell than `before_script` and `script`
+    function activate {
+        export PATH="$$PATH:$$(pwd)/.ci-helper/scripts"
+        for path in .ci-helper/functions/*; do
+            source $$path
+        done
+    }
+
+    mkdir -p .ci-helper/scripts .ci-helper/functions
+    unpack_resources
+    activate
+
+    # Deprecated use of `./julia-ci`
+    ln -sf .ci-helper/scripts/julia-ci julia-ci
+
+  # Note: Deprecation for use of "common_functions" for repos not directly importing from
+  # /templates/common-functions.yml
+  common_functions: |
+    echo 'Using "common_functions" is deprecated, use "ci_init" instead: ' >&2
+    echo '```' >&2
+    echo 'echo "$$ci_init" > ci_init && source ci_init && rm ci_init' >&2
+    echo '```' >&2
+
+    [[ $$allow_deprecations == "false" ]] && exit 1
+
+    if [ -n "$$ci_init" ]; then
+        echo "$$ci_init" > ci_init && source ci_init && rm ci_init
+    else
+        echo 'ERROR: "ci_init" is unexpectedly empty' >&2
+        exit 1
+    fi

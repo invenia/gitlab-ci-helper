@@ -1,0 +1,266 @@
+---
+stages:
+  - setup
+  - test
+  - teardown
+  - deploy
+
+include:
+  - local: /templates/ci-init.yml
+  - local: /templates/hidden-jobs.yml
+  - local: /templates/teardown.yml
+
+# The `julia`, `os`, and `platform` variables form the matrix of jobs which will be run.
+# Using `exclude` can be used to remove a job from the matrix while `include` is the inverse.
+variables:
+  julia: "1.8"       # Set of Julia versions: {"X.Y"..., "nightly"}
+  os: "linux, mac"            # Set of OS's to use: {"linux", "mac"}
+  platform: "x86_64"          # Set of architectures to use: {"x86_64"}
+  high_memory: "false"        # Use high-memory runners for Linux 64-bit jobs
+  exclude: ""                 # Set of quoted job names: {"\"1.0 (Linux, i686)\"", ...}
+  include: ""                 # Set of quoted job names: {"\"1.0 (Mac)\"", ...}
+  allow_deprecations: "true"
+  audit: "true"
+
+  # Disable using the Julia package server for now as it can be out-of-sync with registries
+  JULIA_PKG_SERVER: ""
+
+# The job matrix works by using conditional `rules` which allow us to enable jobs based upon
+# conditions being met. Most of the logic used for triggering a job used in the matrix take
+# the form below, with this particular example being for the job named "1.0 (Linux, 64-bit, x86_64)":
+#
+# ```yaml
+# rules:
+#   - if: $julia =~ /(^|[, ])\Q1.0\E([, ]|$)/ && $os =~ /(^|[, ])\Qlinux\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"1.0 (Linux, 64-bit, x86_64)"\E([, ]|$)/
+#   - if: $include =~ /(^|[, ])\Q"1.0 (Linux, 64-bit, x86_64)"\E([, ]|$)/
+# ```
+#
+# The logic appears more complicated than it is since we are using regular expressions to
+# determine if an element is present in the list. For example the regex of the form:
+# /(^|[, ])\Qelement\E([, ]|$)/ determines that "element" is included in the given list
+# (see https://regex101.com/r/qeY0rm/2 for an interactive example).
+#
+# In fact the YAML above re-written as pseudocode would look like:
+#
+# ```
+# rules:
+#   - if ("1.0" ∈ julia && "linux" ∈ os && "x86_64" ∈ platform && CI_JOB_NAME ∉ excludes) || CI_JOB_NAME ∈ include
+# ```
+#
+# Note: Unfortunately we cannot use CI_JOB_NAME inside of the YAML regular expressions at
+# this time for `exclude` or `include`
+#
+# For additional details see:
+# https://docs.gitlab.com/ee/ci/yaml/#supported-onlyexcept-regexp-syntax
+# https://docs.gitlab.com/ee/ci/variables/README.html#environment-variables-expressions
+
+# Example of allowing failures:
+#
+# "1.0 (Linux, i686)":
+#   allow_failure: true
+#
+# "1.1 (Linux, i686)":
+#   allow_failure: true
+
+# The list of tags can be found here: https://gitlab.invenia.ca/infrastructure/EC2v2/blob/master/gitlab/runner/README.md#tags
+
+# Note: Including 64-bit/32-bit in the job titles will be removed in the future as it is redundant with the architecture
+# https://gitlab.invenia.ca/invenia/gitlab-ci-helper/-/issues/47
+
+# Using `rules` enables pipelines for merge requests (https://docs.gitlab.com/ee/ci/merge_request_pipelines/).
+# We'll disable this feature for now until we properly support it.
+workflow:
+  rules:
+    # Disable pipelines for merge requests
+    - if: $CI_MERGE_REQUEST_ID
+      when: never
+    - when: always
+# Test for deprecations using Linux x86_64 and the same Julia version used by EIS
+"Deprecations":
+  tags:
+    - linux
+    - x86_64
+    - docker-ci
+  variables:
+    JULIA_DEPWARN: "error"
+  rules:
+    # Allows packages to state that all deprecations have been addressed and new ones should cause failures
+    - if: $allow_deprecations == "false" && $high_memory == "false" && $julia =~ /(^|[, ])\Q1.8\E([, ]|$)/ && $os =~ /(^|[, ])\Qlinux\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"Deprecations"\E([, ]|$)/
+      allow_failure: false
+    - if: $allow_deprecations == "false" && $include =~ /(^|[, ])\Q"Deprecations"\E([, ]|$)/
+      allow_failure: false
+
+    - if: $high_memory == "false" && $julia =~ /(^|[, ])\Q1.8\E([, ]|$)/ && $os =~ /(^|[, ])\Qlinux\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"Deprecations"\E([, ]|$)/
+      allow_failure: true
+    - if: $include =~ /(^|[, ])\Q"Deprecations"\E([, ]|$)/
+      allow_failure: true
+  extends:
+    - .test_docker
+    - .test_1_8
+
+"Deprecations (High-Memory)":
+  tags:
+    - linux
+    - x86_64
+    - docker-ci
+    - high-memory
+  variables:
+    JULIA_DEPWARN: "error"
+  rules:
+    # Allows packages to state that all deprecations have been addressed and new ones should cause failures
+    - if: $allow_deprecations == "false" && $high_memory == "true" && $julia =~ /(^|[, ])\Q1.8\E([, ]|$)/ && $os =~ /(^|[, ])\Qlinux\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"Deprecations (High-Memory)"\E([, ]|$)/
+      allow_failure: false
+    - if: $allow_deprecations == "false" && $include =~ /(^|[, ])\Q"Deprecations (High-Memory)"\E([, ]|$)/
+      allow_failure: false
+
+    - if: $high_memory == "true" && $julia =~ /(^|[, ])\Q1.8\E([, ]|$)/ && $os =~ /(^|[, ])\Qlinux\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"Deprecations (High-Memory)"\E([, ]|$)/
+      allow_failure: true
+    - if: $include =~ /(^|[, ])\Q"Deprecations (High-Memory)"\E([, ]|$)/
+      allow_failure: true
+  extends:
+    - .test_docker
+    - .test_1_8
+
+
+"1.6 (Mac)":
+  tags:
+    - macos
+    - shell-ci
+  variables:
+    JULIA_PKG_USE_CLI_GIT: "true"
+  rules:
+    # Currently we have too many jobs for the mac runner(s) in place,
+    # so not running for research repos, and not running on nightly
+    # https://gitlab.invenia.ca/invenia/gitlab-ci-helper/-/issues/92
+    # https://gitlab.invenia.ca/invenia/gitlab-ci-helper/-/issues/107
+    - if: $CI_PROJECT_NAMESPACE == "invenia/research" || $GITLAB_USER_LOGIN =~ /^nightly/
+      when: never
+    - if: $julia =~ /(^|[, ])\Q1.6\E([, ]|$)/ && $os =~ /(^|[, ])\Qmac\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"1.6 (Mac)"\E([, ]|$)/
+    - if: $include =~ /(^|[, ])\Q"1.6 (Mac)"\E([, ]|$)/
+  retry:
+    max: 2
+    when: runner_system_failure
+  extends:
+    - .test_shell
+    - .test_1_6
+
+"1.6 (Linux, x86_64)":
+  tags:
+    - linux
+    - x86_64
+    - docker-ci
+  rules:
+    - if: $high_memory == "false" && $julia =~ /(^|[, ])\Q1.6\E([, ]|$)/ && $os =~ /(^|[, ])\Qlinux\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"1.6 (Linux, x86_64)"\E([, ]|$)/
+    - if: $include =~ /(^|[, ])\Q"1.6 (Linux, x86_64)"\E([, ]|$)/
+  extends:
+    - .test_docker
+    - .test_1_6
+
+"1.6 (Linux, x86_64, High-Memory)":
+  tags:
+    - linux
+    - x86_64
+    - docker-ci
+    - high-memory
+  rules:
+    - if: $high_memory == "true" && $julia =~ /(^|[, ])\Q1.6\E([, ]|$)/ && $os =~ /(^|[, ])\Qlinux\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"1.6 (Linux, x86_64, High-Memory)"\E([, ]|$)/
+    - if: $include =~ /(^|[, ])\Q"1.6 (Linux, x86_64, High-Memory)"\E([, ]|$)/
+  extends:
+    - .test_docker
+    - .test_1_6
+
+
+"1.7 (Mac)":
+  tags:
+    - macos
+    - shell-ci
+  variables:
+    JULIA_PKG_USE_CLI_GIT: "true"
+  rules:
+    # Currently we have too many jobs for the mac runner(s) in place,
+    # so not running for research repos, and not running on nightly
+    # https://gitlab.invenia.ca/invenia/gitlab-ci-helper/-/issues/92
+    # https://gitlab.invenia.ca/invenia/gitlab-ci-helper/-/issues/107
+    - if: $CI_PROJECT_NAMESPACE == "invenia/research" || $GITLAB_USER_LOGIN =~ /^nightly/
+      when: never
+    - if: $julia =~ /(^|[, ])\Q1.7\E([, ]|$)/ && $os =~ /(^|[, ])\Qmac\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"1.7 (Mac)"\E([, ]|$)/
+    - if: $include =~ /(^|[, ])\Q"1.7 (Mac)"\E([, ]|$)/
+  retry:
+    max: 2
+    when: runner_system_failure
+  extends:
+    - .test_shell
+    - .test_1_7
+
+"1.7 (Linux, x86_64)":
+  tags:
+    - linux
+    - x86_64
+    - docker-ci
+  rules:
+    - if: $high_memory == "false" && $julia =~ /(^|[, ])\Q1.7\E([, ]|$)/ && $os =~ /(^|[, ])\Qlinux\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"1.7 (Linux, x86_64)"\E([, ]|$)/
+    - if: $include =~ /(^|[, ])\Q"1.7 (Linux, x86_64)"\E([, ]|$)/
+  extends:
+    - .test_docker
+    - .test_1_7
+
+"1.7 (Linux, x86_64, High-Memory)":
+  tags:
+    - linux
+    - x86_64
+    - docker-ci
+    - high-memory
+  rules:
+    - if: $high_memory == "true" && $julia =~ /(^|[, ])\Q1.7\E([, ]|$)/ && $os =~ /(^|[, ])\Qlinux\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"1.7 (Linux, x86_64, High-Memory)"\E([, ]|$)/
+    - if: $include =~ /(^|[, ])\Q"1.7 (Linux, x86_64, High-Memory)"\E([, ]|$)/
+  extends:
+    - .test_docker
+    - .test_1_7
+
+
+"1.8 (Mac)":
+  tags:
+    - macos
+    - shell-ci
+  variables:
+    JULIA_PKG_USE_CLI_GIT: "true"
+  rules:
+    # Currently we have too many jobs for the mac runner(s) in place,
+    # so not running for research repos, and not running on nightly
+    # https://gitlab.invenia.ca/invenia/gitlab-ci-helper/-/issues/92
+    # https://gitlab.invenia.ca/invenia/gitlab-ci-helper/-/issues/107
+    - if: $CI_PROJECT_NAMESPACE == "invenia/research" || $GITLAB_USER_LOGIN =~ /^nightly/
+      when: never
+    - if: $julia =~ /(^|[, ])\Q1.8\E([, ]|$)/ && $os =~ /(^|[, ])\Qmac\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"1.8 (Mac)"\E([, ]|$)/
+    - if: $include =~ /(^|[, ])\Q"1.8 (Mac)"\E([, ]|$)/
+  retry:
+    max: 2
+    when: runner_system_failure
+  extends:
+    - .test_shell
+    - .test_1_8
+
+"1.8 (Linux, x86_64)":
+  tags:
+    - linux
+    - x86_64
+    - docker-ci
+  rules:
+    - if: $high_memory == "false" && $julia =~ /(^|[, ])\Q1.8\E([, ]|$)/ && $os =~ /(^|[, ])\Qlinux\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"1.8 (Linux, x86_64)"\E([, ]|$)/
+    - if: $include =~ /(^|[, ])\Q"1.8 (Linux, x86_64)"\E([, ]|$)/
+  extends:
+    - .test_docker
+    - .test_1_8
+
+"1.8 (Linux, x86_64, High-Memory)":
+  tags:
+    - linux
+    - x86_64
+    - docker-ci
+    - high-memory
+  rules:
+    - if: $high_memory == "true" && $julia =~ /(^|[, ])\Q1.8\E([, ]|$)/ && $os =~ /(^|[, ])\Qlinux\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E|\Qx86\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"1.8 (Linux, x86_64, High-Memory)"\E([, ]|$)/
+    - if: $include =~ /(^|[, ])\Q"1.8 (Linux, x86_64, High-Memory)"\E([, ]|$)/
+  extends:
+    - .test_docker
+    - .test_1_8

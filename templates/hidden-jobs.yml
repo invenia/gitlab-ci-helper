@@ -1,0 +1,365 @@
+# include:
+#   - local: /templates/ci-init.yml
+
+# Default environmental variables which can be overridden as long as the global override
+# occurs after the inclusion of this file.
+variables:
+  OPS_ECR_DOMAIN: 111111111111.dkr.ecr.us-east-1.amazonaws.com  # "Operations" AWS account
+  DATADEPS_ALWAYS_ACCEPT: "true"
+  JULIA_DEPWARN: "no"
+  RETRY_ERRORS: |
+    GitError(Code:ERROR, Class:Net, SecureTransport error: connection closed via error)
+    GitError(Code:ERROR, Class:SSH, SSH could not read data: transport read)
+    GitError(Code:ERROR, Class:Net, Error sending data: Broken pipe)
+    GitError(Code:EEOF, Class:Net, early EOF)
+  REGISTRATOR2_BRANCH: main # CI tests for registrator2 branches should override this
+  MOCK_REGISTER: "false" # CI tests should override and set it to "true"
+
+# Included files cannot be used with YAML aliases, so extends must be used instead
+# We're also using extends within the file for consistency
+# https://docs.gitlab.com/ee/ci/yaml/#include
+# https://docs.gitlab.com/ee/ci/yaml/#extends
+.test:
+  artifacts:
+    name: $CI_JOB_NAME
+    expire_in: 30 days
+    when: always  # Always include Manifest.toml
+    paths:
+      - Manifest.toml
+      - coverage/$CI_JOB_NAME
+  dependencies: []  # Avoid retrieving artifacts from previous stages
+  interruptible: true
+  variables:
+    PYTHON: ""  # Configure PyCall to use the Conda.jl package's Python
+
+.test_1_6:
+  variables:
+    JULIA_VERSION: "1.6"
+
+.test_1_7:
+  variables:
+    JULIA_VERSION: "1.7"
+
+.test_1_8:
+  variables:
+    JULIA_VERSION: "1.8"
+
+.test_nightly:
+  variables:
+    JULIA_VERSION: "nightly"
+  allow_failure: true
+
+.test_shell:
+  retry:
+    max: 2
+    when: stuck_or_timeout_failure
+  # Note: Avoid defining `before_script` to support end-users to installing additional requirements
+  script:
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - julia-ci install $JULIA_VERSION
+    - source julia-ci export
+    - julia-ci test
+    - julia-ci coverage
+  after_script:
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - julia-ci clean
+  extends: .test
+
+.test_docker:
+  image: $OPS_ECR_DOMAIN/julia-gitlab-ci:$JULIA_VERSION
+  retry:
+    max: 2
+    when: runner_system_failure  # Work around issues with our docker-ci runners scaling down
+  # Note: Avoid defining `before_script` to support end-users to installing additional requirements
+  script:
+    - |
+      if [[ $(julia -E 'VERSION >= v"0.7.0-DEV.5183"') == "true" ]] && [[ -f "Project.toml" || -f "JuliaProject.toml" ]]; then
+          # If the Project file is present we can make an environment. Using an environment
+          # allows the option of using a Manifest file which is not used when using "dev".
+          julia --project --depwarn=$JULIA_DEPWARN -e "
+              using Pkg
+              if haskey(ENV, \"RETRY_ERRORS\")
+                  check = (s, e) -> e isa Pkg.Types.PkgError && any(occursin.(split(ENV[\"RETRY_ERRORS\"], '\\n'), e.msg))
+                  retry(Pkg.instantiate, check=check)()
+              else
+                  Pkg.instantiate()
+              end
+              if isfile(\"deps/build.jl\")  # Instantiate doesn't build the current project
+                  if VERSION >= v\"1.1.0-rc1\"
+                      Pkg.build(verbose=true)
+                  else
+                      Pkg.build()
+                  end
+              end
+              isfile(\"Manifest.toml\") && Pkg.status()  # Display any branches being used in a Manifest.toml
+              Pkg.test(coverage=true)
+          "
+      else
+          julia -e --depwarn=$JULIA_DEPWARN "
+              using Pkg
+              Pkg.update()  # Make sure the package registry is up-to-date
+              Pkg.develop(PackageSpec(url=pwd()))
+              if VERSION >= v\"1.1.0-rc1\"
+                  Pkg.build(\"$PKG_NAME\", verbose=true)
+              else
+                  Pkg.build(\"$PKG_NAME\")
+              end
+              Pkg.test(\"$PKG_NAME\"; coverage=true)
+          "
+      fi
+    - julia-coverage . "coverage/$CI_JOB_NAME"
+  extends: .test
+
+.coverage:
+  image: $OPS_ECR_DOMAIN/julia-gitlab-ci:$JULIA_VERSION
+  coverage: /Test Coverage (\d+\.\d+%)/
+  artifacts:
+    name: coverage-combined
+    expire_in: 1 week
+    paths:
+      - coverage
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/combined/cobertura.xml
+  tags:
+    - linux
+    - x86_64  # Note: Only required until our Docker image supports aarch64
+    - docker-ci
+  interruptible: true
+  retry:
+    max: 2
+    when: runner_system_failure  # Work around issues with our docker-ci runners scaling down
+  variables:
+    JULIA_VERSION: "1.6"
+  # Note: Avoid defining `before_script` to support end-users to installing additional requirements
+  script:
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - pip3 install lcov_cobertura~=2.0
+    - julia-ci publish-coverage coverage/combined
+  after_script:
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - julia-ci clean
+
+.format_check:
+  stage: teardown
+  needs: []
+  image: $OPS_ECR_DOMAIN/julia-gitlab-ci:$JULIA_VERSION
+  tags:
+    - linux
+    - docker-ci
+  interruptible: true
+  allow_failure: true
+  variables:
+    JULIA_VERSION: "1.6"
+  script:
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - '[[ $CI_DISPOSABLE_ENVIRONMENT == "true" && -x "$(command -v yum)" ]] && yum install -y -q git'
+    - julia-ci format
+
+.documentation:
+  artifacts:
+    # As documentation is re-deployed daily the expiry just ensures that old documentation
+    # is eventually cleaned up. Note: Archived projects will have documentation expire.
+    expire_in: 1 week
+    paths:
+      - documentation/
+  tags:
+    # Always run on the same architecture for consistency
+    - x86_64
+  dependencies: []  # Avoid retrieving artifacts from previous stage (including the Manifest.toml)
+  interruptible: true
+  retry:
+    max: 2
+    when: runner_system_failure  # Work around issues with our docker-ci runners scaling down
+  variables:
+    JULIA_VERSION: "1.6"
+    PYTHON: ""  # Configure PyCall to use the Conda.jl package's Python
+  # Note: Avoid defining `before_script` to support end-users to installing additional requirements
+  script:
+    - '[[ $CI_DISPOSABLE_ENVIRONMENT == "true" && $(cat /etc/system-release-cpe | cut -d: -f 5-6) == "amazon_linux:2" ]] && yum install -y -q bzip2'
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - julia-ci install $JULIA_VERSION
+    - source julia-ci export
+    - julia-ci build-docs
+  after_script:
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - julia-ci clean
+
+# GitLab Pages: https://docs.gitlab.com/ee/user/project/pages/#how-it-works
+.pages:
+  artifacts:
+    # As documentation is re-deployed daily the expiry just ensures that old documentation
+    # is eventually cleaned up. Note: Archived projects will have documentation expire.
+    expire_in: 1 week
+    paths:
+      - public/  # Note: Required to be called public for GitLab Pages
+  retry:
+    max: 2
+    when: runner_system_failure  # Work around issues with our docker-ci runners scaling down
+  script:
+    - mkdir public
+    # The default index file should be the documentation
+    - '[ -d documentation ] && mv documentation/* public/'
+    # Only publishing the combined coverage as navigating to the individual coverage reports is difficult
+    - '[ -d coverage ] && mv coverage/combined public/coverage'
+    # Used to validate the pipeline that generated the published documentation
+    - echo "$CI_PIPELINE_ID" > public/pipeline_id.html
+
+.benchmark_code:
+  tags:
+    - linux
+    - x86_64
+    - docker-ci
+  interruptible: true
+  artifacts:
+    reports:
+      metrics: benchmark/output/metrics.txt
+      performance: benchmark/output/performance.json
+    paths:
+      - benchmark/output
+    expire_in: 1 week
+  variables:
+    mem_unit: b
+    time_unit: ns
+    alloc_unit: ""
+  script:
+    # julia-ci doesn't play nicely with docker jobs so the julia code lives here for now.
+    - yum install -y jq
+    - save_path="benchmark/output"
+    - mkdir -p "$save_path"
+    - |
+      julia --project=benchmark/ -e "
+        using Pkg
+        # Make sure registry can see new versions
+        Pkg.Registry.update()
+
+        Pkg.develop(PackageSpec(path=\".\"))
+        Pkg.build(verbose=true)
+
+        using PkgBenchmark
+        benchmarkpkg(\".\", verbose=true, resultfile=joinpath(\"$save_path\", \"benchmark_results.json\"))
+      "
+    - cp benchmark/tune.json "$save_path/tune.json"
+    - |
+      julia -e "
+        using Pkg
+        Pkg.add(\"JSON\")
+        Pkg.add(\"BenchmarkTools\")
+        Pkg.add(\"PkgBenchmark\")
+
+        using JSON
+        using BenchmarkTools
+        using PkgBenchmark
+
+        function collect_stats(bg::BenchmarkTools.BenchmarkGroup)
+            stats = Dict()
+            for (a, b) in collect(leaves(bg))
+                n = join(a, \".\")
+                for f in (median, minimum)
+                    stats[\"\$n \$(f)_time\"] = time(f(b))
+                    stats[\"\$n \$(f)_allocs\"] = allocs(f(b))
+                    stats[\"\$n \$(f)_memory\"] = memory(f(b))
+                    stats[\"\$n \$(f)_gctime\"] = gctime(f(b))
+                end
+            end
+
+            return stats
+        end
+
+        results = PkgBenchmark.readresults(joinpath(\"$save_path\", \"benchmark_results.json\"))
+        export_markdown(stdout, results)
+
+        bg = PkgBenchmark.benchmarkgroup(results)
+        stats = collect_stats(bg)
+        open(io -> JSON.print(io, stats, 4), joinpath(\"$save_path\", \"stats.json\"), \"w\")
+      "
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - rescale_json_values "$save_path/stats.json" $time_unit $mem_unit $alloc_unit > "$save_path/transformed_stats.json"
+    - format_benchmark_reports "$save_path/transformed_stats.json" metrics
+  extends:
+    - .test_docker
+    - .test_1_6
+
+.benchmark_deps:
+  stage: teardown
+  tags:
+    - linux
+    - x86_64
+    - docker-ci
+  artifacts:
+    paths:
+      - benchmark/output
+    expire_in: 1 week
+  interruptible: true
+  script:
+    - save_path="benchmark/output"
+    # Copy generated tuning file if untracked
+    - |
+      [ -f "benchmark/tune.json" ] || cp "$save_path/tune.json" benchmark/tune.json
+    - |
+      julia --project=benchmark/ -e "
+        using Pkg
+
+        Pkg.instantiate()
+        Pkg.develop(PackageSpec(path=\".\"))
+        Pkg.update()
+
+        using PkgBenchmark
+
+        result = benchmarkpkg(\".\", resultfile=joinpath(\"$save_path\", \"updated_results.json\"), verbose=true)
+        println(\"Updated Benchmarks\")
+        export_markdown(stdout, result)
+      "
+    - cp benchmark/Manifest.toml "$save_path/Manifest.toml"
+    - |
+      julia --project=benchmark/ -e "
+        using BenchmarkTools
+        using PkgBenchmark
+
+        result_new = PkgBenchmark.readresults(joinpath(\"$save_path\", \"updated_results.json\"))
+        result_old = PkgBenchmark.readresults(joinpath(\"$save_path\", \"benchmark_results.json\"))
+
+        judgement = judge(result_new, result_old)
+        export_markdown(stdout, judgement)
+
+        if BenchmarkTools.isregression(judgement)
+            error(\"Performance regression, see results above\")
+        end
+      "
+  extends:
+    - .test_docker
+    - .test_1_6
+
+.register:
+  rules:
+    - if: $exclude =~ /(^|[, ])\Q"Register"\E([, ]|$)/
+      when: never
+      # Don't run for scheduled pipelines, i.e. nightly
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    # Attempt registration when Project.toml changes in the default branch
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+      - "Project.toml"
+  trigger:
+    project: invenia/continuous-delivery/registrator2
+    branch: $REGISTRATOR2_BRANCH
+    # mirror pipeline status from registrator2 (if registration fails, the pipeline fails)
+    strategy: depend
+  variables:
+    REPO_URL: $CI_PROJECT_URL
+    GIT_REFERENCE: $CI_COMMIT_SHA
+    MOCK_REGISTER: $MOCK_REGISTER
+  inherit:
+    # Note it is important not to inherit other global variables such as `ci_init`.
+    # This is necessary to avoid issues where e.g. the `ci_init` variable is passed to the
+    # triggered job and then executed, which results in the error "$: No such file or directory"
+    # because the variables seem to be shell-expanded when passed this way.
+    # Therefore if you need to remove all variables from the following list, you should leave
+    # the following in place:
+    #   variables: false
+    #
+    # See https://docs.gitlab.com/ee/ci/yaml/#inheritvariables
+    variables:
+      - REGISTRATOR2_BRANCH

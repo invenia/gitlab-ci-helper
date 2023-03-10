@@ -1,0 +1,59 @@
+# https://gitlab.invenia.ca/invenia/gitlab-ci-helper/tests/test-role.yml
+#
+# Used in testing `assume_test_role` and `unassume_test_role` common functions
+#
+# ```
+# aws cloudformation create-stack \
+#   --stack-name test-role \
+#   --template-body file://tests/test-role.yml \
+#   --capabilities CAPABILITY_NAMED_IAM \
+#   --parameters \
+#     ParameterKey=CIRoleArn,ParameterValue=arn:aws:iam::${ACCOUNT_ID}:role/GitLabCIRunnerRole
+# ```
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  A stack used to test `assume_test_role` and `unassume_test_ro`
+
+Parameters:
+  CIRoleArn:
+    Description: The role ARN used when executing GitLab CI test stage jobs.
+    Type: String
+    AllowedPattern: "arn:aws:iam::\\d{12}:role/[^/]+"
+
+  ServicesAccount:
+    Description: The account containing Shared Services
+    Type: String
+    AllowedPattern: "\\d{12}"
+
+Resources:
+  TestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-TestRole
+      MaxSessionDuration: 10800   # We'll assume this role for up to 3 hours
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref CIRoleArn
+            Action: sts:AssumeRole
+
+  TestPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: TestPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          # `stack_status`
+          - Effect: Allow
+            Action: cloudformation:ListStacks
+            Resource: "*"
+
+          # `stack_exists`
+          - Effect: Allow
+            Action: cloudformation:DescribeStacks
+            Resource: "*"
+      Roles: [!Ref TestRole]

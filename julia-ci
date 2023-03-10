@@ -1,0 +1,559 @@
+#!/bin/bash
+
+# Automates the process of downloading a Julia binary and installing it. For use with Gitlab-CI.
+
+# Details on GitLab-CI environmental variables
+# http://docs.gitlab.com/ce/ci/variables/README.html
+
+set -e
+
+JULIA_CMD="julia --color=yes"
+
+if [ -n "$JULIA_CI_DEPWARN" ]; then
+    JULIA_CMD="$JULIA_CMD --depwarn=$JULIA_CI_DEPWARN"
+fi
+
+abspath() {
+    echo "$(cd "$(dirname "$1")"; pwd -P)/$(basename "$1")"
+}
+
+# Equivalent to `readlink -f` but works on macOS
+_readlink() {
+    local file="$1"
+
+    # Iterate down a (possible) chain of symlinks
+    while [ -L "$file" ]; do
+        file="$(readlink $file)"
+    done
+
+    echo $(abspath "$file")
+}
+
+# Checks whether the current environment is on CI and if not, throw an error. This
+# provides a safeguard against performing potentially unsafe operations locally. Any
+# function that should not be run locally should call this function at the top.
+ensure_ci() {
+    if [ "$CI" != "true" ]; then
+        echo "Script is not being run within a CI environment" >&2
+        exit 3
+    fi
+}
+
+install_system_packages() {
+    if [ -x "$(command -v tar)" ] || [ -x "$(command -v git)" ] || [ -x "$(command -v curl)" ] || [ -x "$(command -v rsync)" ]; then
+        if [ -x "$(command -v yum)" ]; then
+            yum install -y -q git tar curl rsync
+        elif [ -x "$(command -v apt-get)" ]; then
+            apt-get -y -q install git tar curl rsync
+        else
+            echo "Please ensure git, curl, rsync and tar are installed" >&2
+            exit 1
+        fi
+    fi
+}
+
+git_clone() {
+    # Note: The `--no-progress` flag disables only progress meters for all but "Checking out files"
+    git clone "$@" --no-progress 2>&1 | grep -v 'Checking out files'
+}
+
+# Based off of the logic in the travis build script:
+# https://github.com/travis-ci/travis-build/blob/master/lib/travis/build/script/julia.rb
+julia_url() {
+    version=$1; os=$2; arch=$3
+
+    [ -z "$os" ] && os=$(uname)
+    [ -z "$arch" ] && arch=$(uname -m)
+
+    if [ "$os" == "Linux" -a $arch == "x86_64" ]; then
+        os_arch="linux/x64"
+        ext="linux-x86_64.tar.gz"
+        nightly_ext="linux64.tar.gz"
+    elif [ "$os" == "Linux" -a $arch == "i686" ]; then
+        os_arch="linux/x86"
+        ext="linux-i686.tar.gz"
+        nightly_ext="linux32.tar.gz"
+    elif [ "$os" == "Linux" -a $arch == "aarch64" ]; then
+        os_arch="linux/aarch64"
+        ext="linux-aarch64.tar.gz"
+        nightly_ext="linuxaarch64.tar.gz"
+    elif [ "$os" == "Darwin" -a $arch == "x86_64" ]; then
+        os_arch="mac/x64"
+        ext="mac64.dmg"
+        nightly_ext="$ext"
+    elif [ "$os" == "Darwin" -a $arch == "arm64" ]; then
+        # Julia on ARM only has tier 3 support and does not have builds for all versions
+        # Pretend to be x86_64 and run with Rosetta for now
+        # https://gitlab.invenia.ca/invenia/gitlab-ci-helper/-/issues/93
+        os_arch="mac/x64"
+        ext="mac64.dmg"
+        nightly_ext="$ext"
+    elif [ "$os" == "Windows" -a $arch == "x86_64" ]; then
+        os_arch="winnt/x64"
+        ext="win64.exe"
+        nightly_ext="$ext"
+    elif [ "$os" == "Windows" -a $arch == "i686" ]; then
+        os_arch="winnt/x86"
+        ext="win32.exe"
+        nightly_ext="$ext"
+    else
+        echo "Julia does not support $arch $os" >&2
+        exit 1
+    fi
+
+    # Note: We are not supporting versions such as "release" or "1" as there isn't a nice URL for
+    # this: https://github.com/travis-ci/travis-build/blob/master/lib/travis/build/script/julia.rb#L186
+    if [[ "$version" == "nightly" ]]; then
+        url="julialangnightlies-s3.julialang.org/bin/${os_arch}/julia-latest-${nightly_ext}"
+    elif [[ "$version" =~ ^([0-9]+\.[0-9]+)\.[0-9]+$ ]]; then
+        url="julialang-s3.julialang.org/bin/${os_arch}/${BASH_REMATCH[1]}/julia-${version}-${ext}"
+    elif [[ "$version" =~ ^([0-9]+\.[0-9]+)$ ]]; then
+        url="julialang-s3.julialang.org/bin/${os_arch}/${version}/julia-${version}-latest-${ext}"
+    else
+        echo "Unknown Julia version: ${version}" >&2
+        exit 1
+    fi
+
+    echo "https://$url"
+}
+
+# Install Julia
+install_julia() {
+    version=$1; os=$2; arch=$3
+    if [ -z "$version" ]; then
+        echo "A version is required" >&2
+        exit 2
+    fi
+    [ -z "$os" ] && os=$(uname)
+
+    url=$(julia_url $version $os $arch)
+
+    # Change to the temporary directory so we don't mess up the CI_PROJECT_DIR
+    mkdir -p "$CI_TMP_DIR"
+    pushd "$CI_TMP_DIR" > /dev/null
+
+    echo "Downloading: $url"
+    if [ "$os" == "Linux" ]; then
+        mkdir -p "$JULIA_ROOT"
+        curl -sSL --retry 7 "$url" | tar -C "$JULIA_ROOT" -x -z --strip-components=1 -f -
+    elif [ "$os" == "Darwin" ]; then
+        curl -sSL -o julia.dmg "$url"
+        [ ! -d juliamnt ] && mkdir juliamnt
+        hdiutil mount -readonly -mountpoint juliamnt julia.dmg
+        cp -a juliamnt/*.app/Contents/Resources/julia "$JULIA_ROOT"
+        hdiutil detach juliamnt
+        rm -rf juliamnt julia.dmg
+    else
+        echo "Unable to install in OS $os" >&2
+        exit 1
+    fi
+
+    # When provided pre-release version number (e.g "1.3-") make sure that the version of Julia matches the same pre-release.
+    # Note: `"$version" == *-` means $version ends with a dash.
+    julia_ver=$($JULIA_CMD -e 'V = VERSION; print(V.major, ".", V.minor, Base.lowerbound(V) <= V < Base.thisminor(V) ? "-" : "")')
+    if [[ "$version" == *- && "$version" != "$julia_ver" ]]; then
+        echo "Expected Julia pre-release \"$version\" but found \"$julia_ver\"" >&2
+        exit 1
+    fi
+
+    $JULIA_CMD -e "using InteractiveUtils; versioninfo()"
+
+    popd > /dev/null
+}
+
+# Inject the GitLab CI token into the given URL
+inject_token() {
+    URL="$1"
+    ensure_ci
+    [ -z "$CI_JOB_TOKEN" ] || URL=${URL/#https:\/\//https:\/\/gitlab-ci-token:$CI_JOB_TOKEN@}
+    echo "$URL"
+}
+
+# Install the Git credential helper
+# Note: We only install the credential helper using this logic on Docker runners. We expect
+# the credential helper is already setup on shell runners
+install_credential_helper() {
+    ensure_ci
+
+    local gitlab_host=gitlab.invenia.ca
+    local embedded_helper="$(dirname $(_readlink $0))/gitlab-ci-credential"
+    local installed_helper="$(git config --get credential.https://${gitlab_host}.helper || true)"
+
+    if [[ ! -x "$embedded_helper" ]]; then
+        echo "Unable to find gitlab-ci-credential in the same directory as julia-ci" >&2
+        exit 1
+    fi
+
+    # When the contents of the embedded helper differ from the installed one we'll update
+    # to use the embedded helper.
+    if ! cmp --silent "$embedded_helper" "$installed_helper"; then
+        local helper="$HOME/gitlab-ci-credential"
+        cp -p "$embedded_helper" "$helper"
+
+        # Note: Julia uses LibGit2 which doesn't seem to be able to read the local configuration.
+        git config --global credential.https://${gitlab_host}.helper "$helper"
+    else
+        echo "The git credential helper is already installed and up to date." >&2
+    fi
+}
+
+# Validate the credential helper is working correctly. Additional credential helpers
+# installed alongside `gitlab-ci-credential` helper can interfere by storing ephemeral
+# credentials.
+#
+# Note: We can use `GIT_CONFIG_NOSYSTEM` to have `git` ignore the system config file
+# but unfortunately this will not work with Julia
+validate_credential_helper() {
+    if [[ -n "$CI_PROJECT_URL" && -n "$CI_JOB_TOKEN" ]]; then
+        num_helpers=$((git config --get-regexp 'credential.*helper' || true) | wc -l | tr -d '[:space:]')
+        token=$(echo -e "protocol=https\nhost=gitlab.invenia.ca\nusername=gitlab-ci-token\n\n" | git credential fill | grep ^password | cut -d= -f2)
+
+        if [[ "$token" != "$CI_JOB_TOKEN" || $num_helpers -ne 1 ]]; then
+            config=$(git config --show-origin --get-regexp 'credential.*' || true)
+            echo -n "ERROR: Detected invalid git configuration. Most likely you have additional git " >&2
+            echo -n "credential helpers which are interfering with the gitlab-ci-credential " >&2
+            echo -e "helper. Listing git credential config:\n$config" >&2
+            exit 1
+        fi
+    else
+        echo "Skipping validation of credential helper since environment variables CI_PROJECT_URL and CI_JOB_TOKEN are not defined" >&2
+    fi
+}
+
+# Initialize private METADATA repo
+install_private_registries() {
+    REGISTRY_DIR="$JULIA_DEPOT_PATH/registries"
+    PRIVATE_REGISTRY_DIR="$REGISTRY_DIR/Invenia"
+    PRIVATE_REGISTRY_URL="https://gitlab.invenia.ca/invenia/PackageRegistry.git"
+
+    [ -d "$JULIA_DEPOT_PATH" ] || mkdir -p "$JULIA_DEPOT_PATH"
+
+    # Always start fresh in case one of the registries fails to download, which then
+    # leaves it in an incomplete state that persists across builds
+    [ -d "$REGISTRY_DIR" ] && rm -rf "$REGISTRY_DIR"
+
+    # NOTE: Adding the private registry may fail to authenticate unless the credential
+    # helper has installed first.
+    JULIA_DEPOT_PATH="$JULIA_DEPOT_PATH" $JULIA_CMD -e "
+        using Pkg
+        if VERSION >= v\"1.1\"
+            if VERSION >= v\"1.7.0-beta1\"
+                DEFAULT_REGISTRIES = Pkg.Registry.DEFAULT_REGISTRIES
+            else
+                DEFAULT_REGISTRIES = Pkg.Types.DEFAULT_REGISTRIES
+            end
+
+            Pkg.Registry.add([
+                DEFAULT_REGISTRIES;
+                RegistrySpec(url=\"$PRIVATE_REGISTRY_URL\")
+            ])
+        else
+            Pkg.update()  # Add default registries (General)
+            run(\`git clone \"$PRIVATE_REGISTRY_URL\" \"$PRIVATE_REGISTRY_DIR\"\`)
+        end
+    "
+}
+
+
+# Remove the Julia installation, packages, and other temporary files created during the installation
+# and/or testing process
+uninstall() {
+    # julia 1.3 installs as readonly on the mac runner
+    [ -d "$JULIA_ROOT" ] && chmod -R +w "$JULIA_ROOT"
+    # some artifacts install as readonly on the mac runner
+    # this is fixed in Julia 1.6, see https://github.com/JuliaPackaging/Yggdrasil/issues/1969
+    [ -d "$JULIA_DEPOT_PATH" ] && chmod -R +w "$JULIA_DEPOT_PATH"
+    rm -rf "$JULIA_ROOT" "$JULIA_DEPOT_PATH" "$CI_TMP_DIR"
+}
+
+# Export the environmental variables. Needs to be run with "source ..." to work
+export_vars() {
+    export PATH CI_TMP_DIR PKG_NAME JULIA_ROOT JULIA_DEPOT_PATH JULIA_PROJECT TMPDIR
+}
+
+# Export the environmental variables as strings, so the shell can eval them regardless of the shell
+# being used. e.g. `eval $(./julia-ci echo-export)`
+echo_export_vars() {
+    echo "export PATH=\"$PATH\""
+    echo "export CI_TMP_DIR=\"$CI_TMP_DIR\""
+    echo "export PKG_NAME=\"$PKG_NAME\""
+    echo "export JULIA_ROOT=\"$JULIA_ROOT\""
+    echo "export JULIA_DEPOT_PATH=\"$JULIA_DEPOT_PATH\""
+    echo "export JULIA_PROJECT=\"$JULIA_PROJECT\""
+    echo "export TMPDIR=\"$TMPDIR\""
+}
+
+# Installs a custom version of Pkg.jl for debugging:
+# https://gitlab.invenia.ca/invenia/gitlab-ci-helper/issues/5
+pkg_debug_hack() {
+    pushd "$CI_TMP_DIR"
+    [ -d "Pkg.jl" ] && rm -rf "Pkg.jl"
+    echo "Cloning the debugging version of Pkg"
+    git_clone https://github.com/invenia/Pkg.jl.git --branch cv/debugging
+    # Don't start Julia in the current directory, since it will load the local Project
+    # file and write to a local Manifest file, whereas we want to use the global Manifest
+    popd > /dev/null
+    JULIA_DEPOT_PATH="$JULIA_DEPOT_PATH" $JULIA_CMD -e "
+        using Pkg
+        Pkg.develop(PackageSpec(name=\"Pkg\",
+                                uuid=\"3e4c069f-8883-4506-90ba-d9dcc9d305b5\",
+                                path=joinpath(\"$CI_TMP_DIR\", \"Pkg.jl\")))
+    "
+    # Ensure that Pkg is using the right now
+    JULIA_DEPOT_PATH="$JULIA_DEPOT_PATH" $JULIA_CMD -e "
+        using Pkg
+        @show Base.PkgId(Pkg) # Check UUID
+        Pkg.pkg\"status\"     # Check version
+    "
+}
+
+# Install the project at the current directory as a Julia package
+install_this_package() {
+    $JULIA_CMD -e "
+        using Pkg
+        Pkg.develop(PackageSpec(url=pwd()))
+        if VERSION >= v\"1.1.0-rc1\"
+            Pkg.build(\"$PKG_NAME\", verbose=true)
+        else
+            Pkg.build(\"$PKG_NAME\")
+        end
+    "
+}
+
+# Run package tests
+run_tests() {
+    if [[ -f "Project.toml" || -f "JuliaProject.toml" ]]; then
+        # The Project file is used if present we can make an environment. Additionally,
+        # using an environment allows the option of using a Manifest file which is ignored
+        # when using "dev".
+        $JULIA_CMD --project --depwarn=${JULIA_DEPWARN:-yes} -e "
+            using Pkg
+            if haskey(ENV, \"RETRY_ERRORS\")
+                check = (s, e) -> e isa Pkg.Types.PkgError && any(occursin.(split(ENV[\"RETRY_ERRORS\"], '\\n'), e.msg))
+                retry(Pkg.instantiate, check=check)()
+            else
+                Pkg.instantiate()
+            end
+            isfile(\"Manifest.toml\") && Pkg.status()  # Display any branches being used in a Manifest.toml
+            if VERSION >= v\"1.1.0-rc1\"
+                Pkg.build(verbose=true)
+            else
+                Pkg.build()
+            end
+            Pkg.test(coverage=true)
+        "
+    else
+        install_this_package
+        $JULIA_CMD -e --depwarn=${JULIA_DEPWARN:-yes} "
+            using Pkg
+            Pkg.test(\"$PKG_NAME\"; coverage=true)
+        "
+    fi
+}
+
+# Build package documentation using Documenter
+build_docs() {
+    # Note: instantiate seems to skip building the developed package.
+    # We'll trigger a full build if the package contains a build.jl
+    $JULIA_CMD --project=docs/ -e "
+        using Pkg
+        !isfile(\"docs/Project.toml\") && !isfile(\"docs/JuliaProject.toml\") && Pkg.add(\"Documenter\")
+        Pkg.develop(PackageSpec(path=\".\"))
+        if haskey(ENV, \"RETRY_ERRORS\")
+            check = (s, e) -> e isa Pkg.Types.PkgError && any(occursin.(split(ENV[\"RETRY_ERRORS\"], '\\n'), e.msg))
+            retry(Pkg.instantiate, check=check)()
+        else
+            Pkg.instantiate()
+        end
+        if isfile(\"deps/build.jl\")
+            if VERSION >= v\"1.1.0-rc1\"
+                Pkg.build(verbose=true)
+            else
+                Pkg.build()
+            end
+        end
+    "
+    $JULIA_CMD --project=docs/ docs/make.jl
+
+    if [ ! -d docs/build ]; then
+        echo "Documentation was not built" >&2
+        exit 1
+    fi
+
+    # Move the rendered documentation to a folder called "documentation" in the root of
+    # the repo which will be saved in an artifact.
+    mkdir documentation
+    mv docs/build/* documentation/
+}
+
+# Save raw coverage files and an HTML report.
+gen_coverage() {
+    ensure_ci
+    COVERAGE_DIR="$CI_PROJECT_DIR/coverage/$CI_JOB_NAME"
+    mkdir -p "$COVERAGE_DIR/html"
+    $JULIA_CMD --depwarn=no -e "
+        using Pkg
+        Pkg.add(\"Coverage\")
+        "
+    $JULIA_CMD -e "
+        using Printf
+        cd(\"$CI_PROJECT_DIR\")
+        using Coverage
+        cov = process_folder()
+        c, t = get_summary(cov)
+        @printf(\"Test Coverage %.2f%%\\n\", t == 0 ? 0 : c/t * 100)
+        LCOV.writefile(\"$COVERAGE_DIR/coverage.info\", cov)
+    "
+    if [ -x "$(command -v genhtml)" ]; then
+        genhtml --version
+        cp -r "$CI_PROJECT_DIR/src" "$COVERAGE_DIR/html/"
+
+        # No coverage files will result in: `ERROR: no valid records found in tracefile`
+        if [ -n "$(find "$CI_PROJECT_DIR/src" -name '*.cov')" ]; then
+            genhtml -o "$COVERAGE_DIR/html" --prefix "$CI_PROJECT_DIR" "$COVERAGE_DIR/coverage.info"
+        else
+            echo "WARNING: Unable to generate coverage report as no coverage files are present." >&2
+        fi
+
+        find "$COVERAGE_DIR/html" -type f -name "*.jl" -delete
+    else
+        echo "lcov is not installed: can't generate coverage report." >&2
+    fi
+    # Copy over all the coverage files while still maintaining the directory structure.
+    rsync -r --include='*.cov' --include '*.mem' --include='*/' --exclude='*' "$CI_PROJECT_DIR/src/" "$COVERAGE_DIR/raw"
+}
+
+publish_coverage() {
+    ensure_ci
+    coverage_dir=$1
+
+    genhtml --version
+    mkdir -p "$coverage_dir"
+    cp -r "$CI_PROJECT_DIR/src" "$coverage_dir"
+
+    # Store the trace file paths in an array.
+    # Note: special care is taken to handle spaces in paths (https://stackoverflow.com/a/32931403)
+    trace_files=()
+    while IFS= read -r line; do
+        trace_files+=( "$line" )
+    done < <(find "$CI_PROJECT_DIR" -type f -name coverage.info)
+
+    # Display combined summary of the trace files (`lcov --directory src -o -a "merged.info" file1 -a file2 ...`)
+    # Save combined coverage to `merged.info`
+    printf '\-a "%s"\n' "${trace_files[@]}" | xargs lcov --directory src -o "$coverage_dir/merged.info"
+
+    echo "Test Coverage $(genhtml -o "$coverage_dir" --no-prefix "$coverage_dir/merged.info" 2>&1 | grep lines | awk '{print $2}')"
+    find "$coverage_dir" -type f -name "*.jl" -delete
+
+    # Convert output to cobertura for line coverage visualization on Gitlab PRs
+    lcov_cobertura "$coverage_dir/merged.info" -o "$coverage_dir/cobertura.xml"
+}
+
+format() {
+    $JULIA_CMD -e 'using Pkg; Pkg.add("JuliaFormatter")'
+    # This git commmand specifically is needed to find changed files
+    # see https://forum.gitlab.com/t/ci-cd-pipeline-get-list-of-changed-files/26847/18
+    CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r $CI_MERGE_REQUEST_TARGET_BRANCH_SHA -r $CI_COMMIT_SHA)
+    # grep errors when no matches are found, using "||" prevents that error from failing the CI job
+    CHANGED_JULIA_FILES=$(echo "$CHANGED_FILES" | grep '\.jl$' || echo "")
+    $JULIA_CMD -e 'using JuliaFormatter; format(ARGS, BlueStyle(); verbose=true, overwrite=true)' $CHANGED_JULIA_FILES
+    export BAD_FORMAT_FILES=$(git --no-pager diff --name-only -r $CI_COMMIT_SHA)
+    # Print all the files the formatter changed
+    for f in $(echo "$BAD_FORMAT_FILES" | xargs); do
+        git --no-pager diff -r $CI_COMMIT_SHA $f
+    done
+    if [[ $(echo "$BAD_FORMAT_FILES" | wc -c) > 1 ]]; then
+        echo "These files aren't formatted properly:"
+        echo "$BAD_FORMAT_FILES"
+        exit 1
+    else
+        echo "No formatting issues found"
+    fi
+}
+
+cmd=$1; shift;
+if [ -z "$cmd" ]; then
+    echo "A command is required" >&2
+    exit 2
+fi
+
+if [ -z "$CI_PROJECT_DIR" ]; then
+    if [ -z "$CI_TMP_DIR" ]; then                 # Allow custom specification of a temp dir
+        if [ $(uname) == "Linux" ]; then
+            SHACMD=sha1sum
+        else
+            SHACMD=shasum
+        fi
+        _TMP_DIR="${TMPDIR:-${TMP:-${TEMP:-${TEMPDIR:-/tmp}}}}" # Get the system's temp directory
+        SHA=$(pwd | $SHACMD | cut -d' ' -f1)         # take the SHA of the current directory
+        CI_TMP_DIR="$_TMP_DIR/$SHA"                  # and use it to make a temp directory
+        [ -d "$CI_TMP_DIR" ] || mkdir "$CI_TMP_DIR"  # if it doesn't already exist
+    fi
+    PKG_NAME=$(basename ${PWD/%.jl/})             # Assume the current directory is the cloned package
+else
+    CI_TMP_DIR="${CI_PROJECT_DIR}.tmp"            # Temporary directory already created by GitLab
+    PKG_NAME=$(basename ${CI_PROJECT_DIR/%.jl/})  # Name of the Julia package we are testing
+fi
+
+JULIA_ROOT="$CI_TMP_DIR/julia"                # Julia installation directory
+JULIA_DEPOT_PATH="$CI_TMP_DIR/depot"          # Pkg3 package depot
+JULIA_PROJECT="@."                            # Location specifier for projects with Project.toml files
+METADATA_BRANCH="invenia"                     # Branch name to use for the custom invenia/METADATA.jl repo
+
+# Work around (hopefully) https://github.com/JuliaLang/Pkg.jl/issues/795 by ensuring that
+# package files that are downloaded and extracted are on the same volume as their destination
+# after being moved
+TMPDIR="$CI_TMP_DIR"
+
+# Add JULIA_ROOT to PATH if it hasn't been added yet
+if [[ ":$PATH:" != *":$JULIA_ROOT/bin:"* ]]; then
+    PATH="${JULIA_ROOT}/bin:${PATH}"
+fi
+
+if [ "$cmd" == "install" ]; then
+    uninstall  # Allows re-runs to work
+    [ "$CI_DISPOSABLE_ENVIRONMENT" == "true" ] && install_system_packages
+    if [ "$CI" == "true" ]; then
+        install_credential_helper
+        validate_credential_helper
+    fi
+    install_julia $@
+    install_private_registries
+elif [ "$cmd" == "install-julia" ]; then
+    install_julia $@
+elif [ "$cmd" == "install-package" ]; then
+    install_this_package
+elif [ "$cmd" == "check-prerequisites" ]; then
+    install_system_packages
+elif [ "$cmd" == "install-cred-helper" ]; then
+    install_credential_helper
+    validate_credential_helper
+elif [ "$cmd" == "install-pkg-hack" ]; then
+    pkg_debug_hack
+elif [ "$cmd" == "export" ]; then
+    export_vars
+elif [ "$cmd" == "echo-export" ]; then
+    echo_export_vars
+elif [ "$cmd" == "clean" ]; then
+    uninstall
+elif [ "$cmd" == "coverage" ]; then
+    gen_coverage
+elif [ "$cmd" == "publish-coverage" ]; then
+    publish_coverage $@
+elif [ "$cmd" == "format" ]; then
+    format
+elif [ "$cmd" == "test" ]; then
+    run_tests
+elif [ "$cmd" == "build-docs" ]; then
+    build_docs
+elif [ "$cmd" == "publish-docs" ]; then
+    echo "Executing \`julia-ci publish-docs\` is deprecated and it's functionality has been included in \`julia-ci build-docs\`." >&2
+
+    # Only re-build documentation if it hasn't already been built by a previous `julia-ci build-docs`
+    if [ ! -d documentation ]; then
+        build_docs
+    fi
+else
+    echo "Command not recognized" >&2
+    exit 2
+fi

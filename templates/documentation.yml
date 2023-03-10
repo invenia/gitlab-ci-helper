@@ -1,0 +1,20 @@
+# Note: requires "hidden-jobs.yml" to be included first
+
+"Documentation":
+  stage: teardown
+  except:
+    variables:
+      - $exclude =~ /(^|[, ])\Q"Documentation"\E([, ]|$)/
+  extends: .documentation
+  needs: [] # allows the job to start when the pipeline starts
+
+# Use the special job name "pages" to actually trigger deployment of the documentation on master.
+# https://docs.gitlab.com/ee/user/project/pages/getting_started_part_four.html#job
+pages:
+  stage: deploy
+  only:
+    variables:
+      - $CI_DEFAULT_BRANCH == $CI_COMMIT_REF_NAME
+  dependencies:
+    - Documentation
+  extends: .pages

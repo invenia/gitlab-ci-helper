@@ -1,0 +1,27 @@
+variables:
+  required_files: "Project.toml Manifest.toml README.md"
+
+"Find Required Files":
+  # Walk the repository directory and validate that all leaf directories contain the specified 
+  # required files. Defaults are Project.toml, Manifest.toml, and README.md.
+  script:
+    # Identify all valid leaf directories that contain the required files.
+    # If we set mindepth=1 it picks up the README in the root directory.
+    - echo "Required files are $required_files"
+    - |
+      unique_dirs=$(for f in `find . -mindepth 2 -not -path '*/\.*' -not -path '*/dev/*' -type f`; do dirname $f; done | uniq)
+      missing=()
+      for dir in $unique_dirs; do
+        # Check that the required files are present
+        for filename in $required_files; do
+          file="$dir/$filename"
+          [[ -e "$file" ]] || missing+=($file)
+        done
+      done
+
+      # If files are missing print them to screen and exit
+      if [[ -n $missing ]]; then
+          echo "Missing files:"
+          printf '%s\n' "${missing[@]}"
+          exit 1
+      fi

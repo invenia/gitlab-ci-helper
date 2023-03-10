@@ -1,0 +1,7 @@
+# Note: requires "python.yml" to be included first
+
+"Code Format Check":
+  extends: .code_check
+
+"Version Check":
+  extends: .version_check

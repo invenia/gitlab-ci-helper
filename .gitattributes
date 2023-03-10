@@ -1,0 +1,4 @@
+# https://git-scm.com/docs/gitattributes#_using_macro_attributes
+# https://git-scm.com/docs/gitattributes#_marking_files_as_binary
+# Note: GitLab just seems to ignore this file
+templates/resources.yml -diff -merge

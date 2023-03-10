@@ -1,0 +1,59 @@
+#!/bin/bash
+#
+# Clean up orphaned processes left over from canceled jobs as an attempt to work around
+# https://gitlab.com/gitlab-org/gitlab-runner/issues/3101. The approach taken herein is
+# modeled after https://gitlab.com/gitlab-org/gitlab-runner/issues/3101#note_72077695
+# and https://gitlab.com/gitlab-org/gitlab-runner/issues/3031#note_71905742.
+#
+# This script is used in conjunction with a GitLab Runner pre-build-script that emits
+# a file containing information about each running job.
+# See https://gitlab.invenia.ca/infrastructure/EC2v2/blob/master/gitlab/runner/gitlab-ci-runners.yml
+
+set -e
+
+TOKEN="$1"
+if [ -z "$TOKEN" ]; then
+    echo "No runner token provided to kill-runner-procs"
+    exit 1
+fi
+
+for file in /mnt/builds/running_build_*; do
+    # The running builds produce a file called running_build_<id>, where id is the unique
+    # job ID assigned by GitLab, containing the project ID and the job ID separated by a
+    # space. We need these to pass to the GitLab jobs API to get the status of the job
+    # we're looking at.
+    PROJECT=$(awk '{print $1}' "$file")
+    JOB=$(awk '{print $2}' "$file")
+
+    URL="https://gitlab.invenia.ca/api/v4/projects/$PROJECT/jobs/$JOB"
+    STATUS=$(curl -s -g --header "PRIVATE-TOKEN: $TOKEN" "$URL" | jq -r '.status')
+
+    # Attempt to kill any GitLab Runner processes for canceled jobs
+    if [ "$STATUS" = "canceled" ]; then
+        for pdir in /proc/*; do
+            if [ ! -d "$pdir" ] || [ ! -f "$pdir/environ" ]; then
+                continue
+            fi
+            if [ -z "$(grep -Fa "CI_JOB_ID=$JOB" "$pdir/environ" 2>/dev/null)" ]; then
+                continue
+            fi
+            # Kill the process group, thereby killing the process as well. Canceling the
+            # job itself via the GitLab UI kills the login shell process owned by root,
+            # so we only need to kill the child processes owned by gitlab-runner, which
+            # should (hopefully) all be in the same process group. Note however that by
+            # killing the group, we're changing the state of the directory over which
+            # we're iterating, so we may see the `echo`ed message below spuriously if the
+            # group of the process in the current iteration has already been killed.
+            PID=$(basename $pdir)
+            pkill -9 -g $(ps -o pgrp= -p $PID) || echo "Unable to kill process group"
+        done
+    fi
+
+    # Clean up files for completed jobs
+    if [ "$STATUS" = "success" ] || [ "$STATUS" = "failed" ] || [ "$STATUS" = "canceled" ]; then
+        rm -f "$file"
+    fi
+
+    # Sleep for a couple of seconds to ensure we don't send too many API requests too quickly
+    sleep 2
+done

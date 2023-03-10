@@ -1,0 +1,103 @@
+# Verifying independent experiments in a Lab repo requires checking for 3 things:
+# 1. That all directories are part of a project, e.g. for each path through the directory tree 
+#   you take you will encounter at least one directory that contains a Project.toml and Manifest.toml.
+#   Hence, each directory either is a project; contains a project; or resides in a project.
+# 2. That no nested projects exist, e.g. once a directory contains a Project.toml then none of 
+#   its subdirectories can contain a Project.toml (excluding /dev folders).
+# 3. No code is shared between projects, but code can be shared within a project.
+
+"Find Empty Environments":
+  # This checks for any leaf directories that can be navigated to without encountering a 
+  # Project.toml and Manifest.toml
+  script:
+    - |
+      # Find all leaf directories - exclude hidden folders and dev folders
+      leaf_dirs=$(find . -not -path '*/\.*' -not -path '*/dev/*' -type d -exec sh -c '(ls -p "{}" | grep />/dev/null) || echo "{}"' \;)
+
+      # Find all directories that contain a Project.toml - exclude dev folders
+      # then find which of those directories that also contain a Manifest.toml
+      project_dirs=$(find $(find . -name 'Project.toml' -not -path '*/dev/*' | xargs -r -n1 dirname) -name 'Manifest.toml' | xargs -r -n1 dirname)
+
+      # Remove all the project_dirs (and their subdirs) from the list of leaf_dirs
+      for p in $project_dirs; do
+        leaf_dirs=$(printf '%s\n' "${leaf_dirs[@]}" | grep -v $p || break)
+      done
+
+      # Anything that's left is a directory with no Project directory in or above it.
+      if [[ -n $leaf_dirs ]]; then
+          echo "The following directories have no Project.toml or Manifest.toml:"
+          printf '%s\n' "${leaf_dirs[@]}"
+          exit 1
+      fi
+
+"Find Nested Environments":
+  # This checks if any directory with a Project.toml contains any sub-directories with their own 
+  # Project.toml (exclude dev folders)
+  script:
+    - |
+      # Find all directories that contain a Project.toml - exclude dev folders
+      project_dirs=$(find . -name 'Project.toml' -not -path '*/dev/*' | xargs -r -n1 dirname)
+
+      # Of those, find all subdirs that also contain Project.toml - exclude dev folders
+      # If we set mindepth=1 it picks up the Project.toml in the host directory.
+      nested_projects=$(
+        find ${project_dirs[*]} -name 'Project.toml' -mindepth 2 -not -path '*/dev/*' | xargs -r -n1 dirname 
+      )
+
+      # If any subdirs are nested environments then print to screen and exit 
+      if [[ -n $nested_projects ]]; then
+          echo "The following Projects are nested:"
+          printf '%s\n' "${nested_projects[@]}"
+          exit 2
+      fi
+
+"Find Shared Code":
+  # This checks if any Julia files in a project 'include' files from other projects.
+  script:
+    - |
+      # Find all directories that contain a Project.toml - exclude dev folders
+      project_dirs=$(find . -name 'Project.toml' -not -path '*/dev/*' | xargs -r -n1 dirname)
+
+      # Initiate the array where we will track the "bad files" sharing code
+      bad_files=()
+  
+      # Loop over all Julia files in each project
+      for p in $project_dirs; do
+        
+        # Determine how "nested" the project is, e.g. "./path/to/Project.toml" => 3 x "/"
+        project_nesting=$(echo $p | grep -o "/" | wc -w)
+
+        for f in $(find $p -type f -name '*.jl'); do
+
+          # Determine how "nested" the host file is, e.g. "./path/to/project/host.jl" => 4 x "/"
+          host_nesting=$(echo $f | grep -o "/" | wc -w)
+
+          # Nesting of file within project = 4-3 = 1
+          nesting=$((host_nesting-project_nesting))
+        
+          # If the host file 'includes' any other files, then we want to count how far up the 
+          # included files are, e.g  "include(../../file.jl)" => 2 x "../"
+          # However, if grep finds no matches it returns an EXIT STATUS 1 which will kill the
+          # pipeline - to prevent this we first check if there are any matches before proceeding.
+          including="0"
+          if grep -q 'include("\.\./' $f; then
+            # We could potentially find multiple lines matching "../" in the same file so we 
+            # have to count how often the pattern occurs on each line and return an array
+            # e.g. "3 3 2" 
+            including=$(grep 'include' $f | grep -on "\.\./" | cut -d ":" -f 1 | uniq -c | awk '{print $1}')
+          fi
+        
+          # The host must not include files outside the project, i.e. when including >= nesting
+          # Ok: "./project/path/host.jl", "../../file.jl" => nesting=3 > including=2
+          # No: "./project/path/host.jl", "../../../../file.jl" => nesting=3 < including=4
+          # Check all values in $including, if any break the condition then add file to the list.
+          for i in $including; do [[ "$i" -ge "$nesting" ]] && bad_files+=("$f") && break; done
+        
+        done
+      done
+
+      if [[ -n $bad_files ]]; then
+        echo "The following files are using code from outside their Project:"
+        printf '%s\n' "${bad_files[@]}"
+        exit 3
+      fi

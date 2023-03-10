@@ -1,0 +1,24 @@
+---
+include:
+  - project: invenia/gitlab-ci-helper
+    file: /templates/julia.yml
+    # ref: branch-name
+
+
+variables:
+  # If your package uses PyCall or depends on a package that does you may also want to set:
+  # PYTHON: ""             # Configure PyCall to use the Conda.jl package's Python
+  # CONDA_JL_VERSION: "2"  # Use Python 2.7 instead of defaulting to Python 3
+
+  # If you need to override the default Julia job matrix:
+  # julia: "1.0, 1.1, 1.2, nightly"     # Set of Julia versions to include in the job matrix: {"X.Y"..., "nightly"}
+  # os: "linux, mac"                    # Set of OS's to include in the job matrix: {"linux", "mac"}
+  # platform: "x86_64, i686"            # Set of architectures to include in the job matrix: {"x86_64", "aarch64", "i686", "x86"}
+  # high_memory: "true"                 # Use high-memory runners for Linux 64-bit jobs
+  # exclude: "\"1.0 (Linux, i686)\""    # Set of job names to exclude from the job matrix
+  # include: "\"1.3 (Linux, x86_64)\""  # Set of jobs to include regardless of job matrix settings
+
+  # Use the following when your package has addressed all deprecations. This setting
+  # will require that the "Deprecations" CI job passes which result in us being alerted
+  # when any new deprecation is introduced.
+  # allow_deprecations: "false"

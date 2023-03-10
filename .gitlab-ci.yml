@@ -1,0 +1,325 @@
+stages:
+  - validate
+  - setup
+  - test
+  - teardown
+
+# Using `rules` enables pipelines for merge requests (https://docs.gitlab.com/ee/ci/merge_request_pipelines/).
+# We'll disable this feature for now until we properly support it.
+workflow:
+  rules:
+    # Disable pipelines for merge requests
+    - if: $CI_MERGE_REQUEST_ID
+      when: never
+    - when: always
+
+variables:
+  STACK_NAME_PREFIX: sandbox-gitlab-ci-helper
+  JULIA_CI_DEPWARN: "error"
+  ATHENA_STACK_NAME: eisdb
+  REGISTRATOR2_BRANCH: main # CI tests for registrator2 branches should override this
+
+include:
+  - local: /templates/ci-init.yml
+
+"Validate CI Initialize":
+  stage: validate
+  script:
+    # Ensure that "templates/resources.yml" is always updated to reflect the current state of external files.
+    - ./compile-resources > expected-resources.yml
+    - |
+      if ! cmp --silent templates/resources.yml expected-resources.yml; then
+          echo 'Please commit an updated "templates/resources.yml" by running:'  >&2
+          echo '```'  >&2
+          echo 'git stash && ./compile-resources > templates/resources.yml && git commit -a -m "Update resources.yml" && git stash pop' >&2
+          echo '```'  >&2
+          exit 1
+      fi
+    # Evaluate `ci_init` to ensure syntax is correct
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    # Show extracted resource files
+    - find .ci-helper
+
+"Validate Julia Template Generation":
+  stage: validate
+  tags:
+    - docker-ci
+  image: 111111111111.dkr.ecr.us-east-1.amazonaws.com/julia-gitlab-ci:1.6
+  script:
+    # Ensure that "templates/julia.yml" is always updated to reflect the current state of external files.
+    - julia gen/julia-template.jl > expected-julia.yml
+    - |
+      if ! cmp --silent templates/julia.yml expected-julia.yml; then
+          echo 'Please commit an updated "templates/julia.yml" by running:'  >&2
+          echo '```'  >&2
+          echo 'git stash && julia gen/julia-template.jl > templates/julia.yml && git commit -a -m "Update julia.yml" && git stash pop' >&2
+          echo '```'  >&2
+          exit 1
+      fi
+
+
+"Setup Environment":
+  stage: setup
+  except:
+    - master
+  when: always
+  environment:
+    name: branch/$CI_COMMIT_REF_SLUG
+    on_stop: "Delete Environment"
+    auto_stop_in: 1 week
+  script:
+    - echo "Setting up environment"
+
+"Create Stack":
+  stage: setup
+  tags:
+    - ci-account
+  # image: amazonlinux:2
+  before_script:
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - install_cloudspy
+    - STACK_NAME=$(stack_name $STACK_NAME_PREFIX)
+    - ACCOUNT_ID=$(aws_account_id)
+    - CI_DEPLOY_ROLE="arn:aws:iam::${ACCOUNT_ID}:role/DeployEIS"  # TODO: Find a different role to use
+  script:
+    - |
+      aws-deploy-stack \
+        --role-arn $CI_DEPLOY_ROLE \
+        --stack-name $STACK_NAME \
+        --template-file ./tests/test-role.yml \
+        --wait \
+        --allow-delete \
+        --params \
+          CIRoleArn=arn:aws:iam::${ACCOUNT_ID}:role/GitLabCIRunnerRole
+
+
+.test_script: &test_script
+  before_script:
+    - '[[ $CI_DISPOSABLE_ENVIRONMENT == "true" && -x "$(command -v yum)" ]] && yum install -y -q git'
+    - git clone https://github.com/JuliaLang/Example.jl Example.jl
+    - cd Example.jl
+    - export CI_PROJECT_DIR=$(pwd)
+    - cp ../julia-ci ../gitlab-ci-credential .
+    - chmod +x ./julia-ci ./gitlab-ci-credential
+  script:
+    - ./julia-ci install-cred-helper
+    # When enabled, pretends to run outside of the CI from this point on
+    - '[[ "$PRETEND_LOCAL" == "true" ]] && unset CI; echo $CI'
+    - '[[ "$PRETEND_LOCAL" == "true" ]] && unset CI_PROJECT_DIR; echo $CI_PROJECT_DIR'
+    - ./julia-ci install $JULIA_VERSION
+    # Test that "source julia-ci export" gives the same results as "eval $(./julia-ci echo-export)"
+    - env | sort > old_env
+    - source julia-ci export
+    - env | sort > new_env
+    - source_export="$(comm -1 -3 old_env new_env)"
+    - echo_export="$(./julia-ci echo-export | sed 's/^export //g' | sed 's/"//g' | sort)"
+    - '[[ "$source_export" != "$echo_export" ]] && exit 1'
+    # Verify that the Invenia package registry is installed
+    - '[[ ! -e "$JULIA_DEPOT_PATH/registries/Invenia" ]] && exit 1'
+    - ./julia-ci test
+    - '[[ $CI == "true" ]] && ./julia-ci coverage'
+    - ./julia-ci build-docs
+    - find documentation  # Show built documentation files
+    - '[[ ! -e documentation/index.html ]] && exit 1'
+    - '[[ -d public ]] && exit 1'  # Avoid unnecessarily creating public directory which is used by GitLab pages
+    - ./julia-ci clean
+  after_script:
+    - ./julia-ci clean  # Fail-safe clean
+
+
+.test_1_8: &test_1_8
+  variables:
+    JULIA_VERSION: "1.8"
+  <<: *test_script
+
+# Test that script works on various system configurations.
+# We'll use the latest release of Julia for this.
+
+"1.8 (Mac, Shell)":
+  tags:
+    - mac
+    - shell-ci
+  retry:
+    max: 2
+    when: runner_system_failure # workaround for sigkill (signal (15)) errors on mac
+  <<: *test_1_8
+
+"1.8 (Linux, Shell)":
+  tags:
+    - linux
+    - shell-ci
+  <<: *test_1_8
+
+"1.8 (Linux, Docker)":
+  image: amazonlinux:2
+  tags:
+    - linux
+    - docker-ci
+  <<: *test_1_8
+
+# Test local behaviour
+
+"Local 1.8 (Linux, Docker)":
+  image: amazonlinux:2
+  tags:
+    - linux
+    - docker-ci
+  variables:
+    JULIA_VERSION: "1.8"
+    PRETEND_LOCAL: "true"
+  <<: *test_script
+
+
+# Validate that the Julia and Python template changes work correctly with packages by
+# triggering a pipeline in special test projects.
+# https://docs.gitlab.com/ee/ci/multi_project_pipelines.html#passing-variables-to-a-downstream-pipeline
+
+"Julia Template Test":
+  rules:
+    - changes:
+      - templates/*
+      - .gitlab-ci.yml
+      - julia-ci
+      - gitlab-ci-credential
+  variables:
+    GITLAB_CI_CONFIG: |-
+      ---
+      include:
+        - project: $CI_PROJECT_PATH
+          file: /templates/julia.yml
+          ref: $CI_COMMIT_SHA
+
+      # Only specify CI jobs to pass if they do not allow failures
+      .test_1_8:
+        variables:
+          CI_PASS: "true"
+
+      .register:
+        variables:
+          REGISTRATOR2_BRANCH: $REGISTRATOR2_BRANCH
+          MOCK_REGISTER: "true"
+
+  trigger:
+    project: invenia/continuous-delivery/TestJuliaTemplate.jl
+    strategy: depend
+
+
+"Python Template Test":
+  rules:
+    - changes:
+      - templates/*
+      - .gitlab-ci.yml
+  variables:
+    GITLAB_CI_CONFIG: |-
+      ---
+      include:
+        - project: $CI_PROJECT_PATH
+          file: /templates/python.yml
+          ref: $CI_COMMIT_SHA
+        - project: $CI_PROJECT_PATH
+          file: /templates/py-check.yml
+          ref: $CI_COMMIT_SHA
+        - project: $CI_PROJECT_PATH
+          file: /templates/teardown.yml
+          ref: $CI_COMMIT_SHA
+
+      # Only specify CI jobs to pass if they do not allow failures
+
+      "Test Python 3.7":
+        variables:
+          CI_PASS: "true"
+        extends: .test_3_7
+
+      "Test Python 3.8":
+        variables:
+          CI_PASS: "true"
+        extends: .test_3_8
+
+      "Test PyPi Build":
+        extends: .test_dist
+
+      "Upload to Private PyPI":
+        extends: .upload_to_private_pypi
+  trigger:
+    project: invenia/data-engineering/testpythontemplate
+    strategy: depend
+
+.test_common_functions: &test_common_functions
+  script:
+    - tests/common-functions.sh
+
+"Common Functions (Amazon Linux 2)":
+  tags:
+    - amzn2
+    - ci-account
+  <<: *test_common_functions
+
+"Common Functions (macOS)":
+  tags:
+    - macos
+  retry:
+    max: 2
+    when: runner_system_failure # workaround for sigkill (signal (15)) errors on mac
+  <<: *test_common_functions
+
+# https://gitlab.invenia.ca/invenia/gitlab-ci-helper/issues/20
+"Common Functions: Partial Python install":
+  tags:
+    - docker-ci
+  image: amazonlinux:2
+  before_script:
+    - yum install -y python3
+  script:
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - enter_python_venv  # Will fail if python3-venv is not installed
+
+# https://gitlab.invenia.ca/invenia/financialbase/-/issues/18
+"Common Functions: Python-dev install":
+  tags:
+    - docker-ci
+    - aarch64
+  image: python:3.7
+  before_script:
+    - apt-get update
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+  script:
+    - install_python_dev  # This should do nothing
+    - enter_python_venv
+    - python3 -m pip install pandas # This will fail if the python version has been changed
+
+.delete: &delete
+  tags:
+    - ci-account
+  before_script:
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - install_awscli
+    - STACK_NAME=$(stack_name $STACK_NAME_PREFIX)
+    - ACCOUNT_ID=$(aws_account_id)
+    - CI_DEPLOY_ROLE="arn:aws:iam::${ACCOUNT_ID}:role/DeployEIS"
+    # Avoid failing if the stack was previously deleted. Note we could still see a failure
+    # if the stack is in "DELETE_IN_PROGRESS" and a re-run is triggered.
+    - aws cloudformation describe-stacks --stack-name $STACK_NAME > /dev/null || exit 0
+  script:
+    - aws cloudformation delete-stack --role-arn $CI_DEPLOY_ROLE --stack-name $STACK_NAME
+    - aws cloudformation wait stack-delete-complete --stack-name $STACK_NAME
+
+"Delete Environment":
+  stage: teardown
+  except:
+    - master
+  when: manual
+  environment:
+    name: branch/$CI_COMMIT_REF_SLUG
+    action: stop
+  dependencies:
+    - "Create Stack"
+  variables:
+    GIT_STRATEGY: none # Avoid checking out a branch after deletion
+  <<: *delete
+
+"Delete Stack":
+  stage: teardown
+  only:
+    - master
+  when: always
+  <<: *delete

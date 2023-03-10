@@ -1,0 +1,303 @@
+---
+include:
+  - local: /templates/ci-init.yml
+
+stages:
+  - setup
+  - test
+  - teardown
+  - deploy
+
+.setup: &setup |
+  echo "$ci_init" > ci_init && source ci_init && rm ci_init
+
+# Set python ci settings
+# Assumes python3
+.py_base:
+  retry:
+    max: 2
+    when: runner_system_failure  # Work around issues with our docker-ci runners scaling down
+  tags:
+    - docker-ci
+  before_script:
+    - *setup
+    - install_private_pypi_creds
+    - enter_python_venv py_base
+    - pip install tox
+
+# Set an artifact for the coverage data
+# Also save the junit.xml report if it exists
+.save_test_coverage:
+  artifacts:
+    # Show JUnit on successful jobs as well as failures
+    when: always
+    paths:
+      - .coverage.*
+    expire_in: 24 hours
+    reports:
+      # Reports shown if pytest is run with `--junitxml=junit.xml`
+      junit: junit.xml
+
+# Set up a python 3.6 docker-ci instance
+.py_3_6:
+  image: python:3.6
+  extends: .py_base
+
+.test_3_6:
+  stage: test
+  script:
+    - tox -re py36
+  extends:
+    - .py_3_6
+    - .save_test_coverage
+
+# Set up a python 3.7 docker-ci instance
+.py_3_7:
+  image: python:3.7
+  extends: .py_base
+
+.test_3_7:
+  stage: test
+  script:
+    - tox -re py37
+  extends:
+    - .py_3_7
+    - .save_test_coverage
+
+# Set up a python 3.8 docker-ci instance
+.py_3_8:
+  image: python:3.8
+  extends: .py_base
+
+.test_3_8:
+  stage: test
+  script:
+    - tox -re py38
+  extends:
+    - .py_3_8
+    - .save_test_coverage
+
+# Set up a python 3.9 docker-ci instance
+.py_3_9:
+  image: python:3.9
+  extends: .py_base
+
+.test_3_9:
+  stage: test
+  script:
+    - tox -re py39
+  extends:
+    - .py_3_9
+    - .save_test_coverage
+
+# Set up a python 3.10 docker-ci instance
+.py_3_10:
+  image: python:3.10
+  extends: .py_base
+
+.test_3_10:
+  stage: test
+  script:
+    - tox -re py310
+  extends:
+    - .py_3_10
+    - .save_test_coverage
+
+# Set some "stable" python version to use for all jobs that require python
+# Except for the jobs that require specific versions of python
+.py_stable:
+  extends: .py_3_8
+
+# Run tox check
+.code_check:
+  tags:
+    - x86_64
+  # Don't bother checking the code of the formatting isn't correct
+  stage: setup
+  script:
+    - tox -re check
+  extends: .py_stable
+
+# Run tox coverage
+.coverage:
+  stage: teardown
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - coverage
+    reports:
+      # Add line coverage on MRs
+      # Shown if tox coverage job includes `coverage xml -o dist/coverage/cobertura.xml`
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura.xml
+  except:
+    - tags
+  coverage: '/TOTAL\s+\d+\s+\d+\s+(\d+\.\d+%)/'
+  script:
+    - tox -re coverage
+    - mv dist/coverage .
+  extends: .py_stable
+
+# Run tox benchmarks
+.benchmark:
+  tags:
+    - docker-ci
+  interruptible: true
+  artifacts:
+    reports:
+      metrics: .benchmarks/metrics.txt
+      performance: .benchmarks/performance.json
+    paths:
+      - .benchmarks
+    expire_in: 1 week
+  variables:
+    mem_unit: b
+    time_unit: ns
+  script:
+    - echo "$ci_init" > ci_init && source ci_init && rm ci_init
+    - package_install jq
+    - tox -re benchmark
+    - |
+      file=$(find .benchmarks -name "*.json")
+      # Save desired stats in nanoseconds
+      jq '.benchmarks[]
+          | {(.name + ".min"): .stats.min, (.name + ".median"): .stats.median, (.name + ".stddev"): .stats.stddev }
+          | with_entries(.key |= . + "_time")
+          | with_entries(.value |= . * 1e9)' $file \
+      | jq -s 'add' > .benchmarks/stats.json
+    - rescale_json_values .benchmarks/stats.json $time_unit $mem_unit > .benchmarks/transformed_stats.json
+    - format_benchmark_reports .benchmarks/transformed_stats.json metrics
+  extends:
+    - .py_stable
+
+# Run tox docs
+.documentation:
+  tags:
+    - x86_64
+    - docker-ci
+  artifacts:
+    # As documentation is re-deployed daily the expiry just ensures that old documentation
+    # is eventually cleaned up. Note: Archived projects will have documentation expire.
+    expire_in: 1 week
+    paths:
+      - documentation
+  script:
+    - tox -re docs
+    - mv dist/docs documentation
+  extends: .py_stable
+
+# GitLab Pages: https://docs.gitlab.com/ee/user/project/pages/#how-it-works
+.pages:
+  artifacts:
+    # As documentation is re-deployed daily the expiry just ensures that old documentation
+    # is eventually cleaned up. Note: Archived projects will have documentation expire.
+    expire_in: 1 week
+    paths:
+      - public/  # Note: Required to be called public for GitLab Pages
+  retry:
+    max: 2
+    when: runner_system_failure  # Work around issues with our docker-ci runners scaling down
+  variables:
+    # Note: Redirecting to `../` is preferred, especially for updated links, but we will
+    # use `../index.html` as this also work for browsing artifacts.
+    docs_redirect_html: |
+      <html>
+      <head>
+        <meta http-equiv="refresh" content="10; url=../index.html" />
+      </head>
+      <body>
+        <p>Use of the "docs" subdirectory is deprecated, please update links/badges to no longer use "docs".</p>
+        <p>If you are not redirected in 10 seconds, <a href="../index.html">click here</a>.</p>
+      </body>
+      </html>
+  script:
+    - mkdir public
+    # The default index file should be the documentation
+    - '[ -d documentation ] && mv documentation/* public/'
+    # Deprecated documentation location of .../docs
+    - |
+      if [ -f public/index.html ]; then
+        mkdir public/docs
+        echo "${docs_redirect_html}" > public/docs/index.html
+      fi
+    # Only publishing the combined coverage as navigating to the individual coverage reports is difficult
+    - '[ -d coverage ] && mv coverage public/coverage'
+    # Used to validate the pipeline that generated the published documentation
+    - echo "$CI_PIPELINE_ID" > public/pipeline_id.html
+
+
+# Check that VERSION file is the same as the tagged version
+.version_check:
+  tags:
+    - x86_64
+  # Don't bother checking the code if the version doesn't match the tag
+  stage: setup
+  only:
+    - tags
+  script:
+    - |
+      pkg_version=$(cat ./VERSION)
+      if [[ ${CI_COMMIT_TAG} != ${pkg_version} ]] ; then
+        echo "tag '$CI_COMMIT_TAG' does not match python version '$pkg_version'"
+        exit 1
+      fi
+
+.build_dist: &build_dist
+  - pip install --upgrade setuptools wheel
+  - rm -rf ./dist
+  - |
+    if [[ "$PLATFORM_SPECIFIC" == "true" ]]; then
+        platform=$(python3 -c "from distutils.util import get_platform; print(get_platform())")
+        python ./setup.py bdist_wheel --plat-name $platform
+    else
+        python ./setup.py sdist bdist_wheel
+    fi
+
+.test_dist:
+  script:
+    - enter_python_venv ppc_upload
+    - *build_dist
+    - cd dist
+    - |
+      for f in *; do
+        pip uninstall -y $CI_PROJECT_NAME
+        # test no files are missing from dists
+        pip install $f --pre
+      done
+    - deactivate
+  extends: .py_stable
+
+# Build and Upload the current package to gitlab pypi
+.upload_to_private_pypi:
+  stage: teardown
+  tags:
+    - docker-ci
+    - x86_64
+  variables:
+    PLATFORM_SPECIFIC: "false"
+  only:
+    - tags
+  script:
+    - enter_python_venv ppc_upload
+    - *build_dist
+    - |
+      # Dependency for twine
+      [[ $CI_DISPOSABLE_ENVIRONMENT == "true" ]] && SUDO="" || SUDO="sudo"
+      if [ -x "$(command -v yum)" ]; then
+          ${SUDO} yum install -y -q libffi-devel
+      elif [ -x "$(command -v apt-get)" ]; then
+          ${SUDO} apt-get -y -q install libffi-dev
+      fi
+    - pip install --upgrade twine
+    - twine upload -r gitlab dist/*
+    - deactivate
+  extends: .py_stable
+
+# Auto-registration not yet implemented for Python repos
+.register:
+  rules:
+    - when: never
+  script:
+    - echo "Auto-registration not yet implemented for Python repos"
+    - exit 1

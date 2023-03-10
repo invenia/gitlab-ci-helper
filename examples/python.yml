@@ -1,0 +1,20 @@
+---
+include:
+  - project: invenia/gitlab-ci-helper
+    file: /templates/python.yml
+  - project: invenia/gitlab-ci-helper
+    file: /templates/py-check.yml
+  - project: invenia/gitlab-ci-helper
+    file: /templates/teardown.yml
+
+# py-check.yml will include "Code Format Check", and "Version Check"
+# teardown.yml will include "Coverage", "Documentation", and "pages"
+
+"Test Python 3.6":
+  extends: .test_3_6
+
+"Test Python 3.7":
+  extends: .test_3_7
+
+"Upload to Private PyPi":
+  extends: .upload_to_private_pypi

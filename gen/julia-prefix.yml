@@ -1,0 +1,77 @@
+---
+stages:
+  - setup
+  - test
+  - teardown
+  - deploy
+
+include:
+  - local: /templates/ci-init.yml
+  - local: /templates/hidden-jobs.yml
+  - local: /templates/teardown.yml
+
+# The `julia`, `os`, and `platform` variables form the matrix of jobs which will be run.
+# Using `exclude` can be used to remove a job from the matrix while `include` is the inverse.
+variables:
+  julia: "1.8"       # Set of Julia versions: {"X.Y"..., "nightly"}
+  os: "linux, mac"            # Set of OS's to use: {"linux", "mac"}
+  platform: "x86_64"          # Set of architectures to use: {"x86_64"}
+  high_memory: "false"        # Use high-memory runners for Linux 64-bit jobs
+  exclude: ""                 # Set of quoted job names: {"\"1.0 (Linux, i686)\"", ...}
+  include: ""                 # Set of quoted job names: {"\"1.0 (Mac)\"", ...}
+  allow_deprecations: "true"
+  audit: "true"
+
+  # Disable using the Julia package server for now as it can be out-of-sync with registries
+  JULIA_PKG_SERVER: ""
+
+# The job matrix works by using conditional `rules` which allow us to enable jobs based upon
+# conditions being met. Most of the logic used for triggering a job used in the matrix take
+# the form below, with this particular example being for the job named "1.0 (Linux, 64-bit, x86_64)":
+#
+# ```yaml
+# rules:
+#   - if: $julia =~ /(^|[, ])\Q1.0\E([, ]|$)/ && $os =~ /(^|[, ])\Qlinux\E([, ]|$)/ && $platform =~ /(^|[, ])\Qx86_64\E([, ]|$)/ && $exclude !~ /(^|[, ])\Q"1.0 (Linux, 64-bit, x86_64)"\E([, ]|$)/
+#   - if: $include =~ /(^|[, ])\Q"1.0 (Linux, 64-bit, x86_64)"\E([, ]|$)/
+# ```
+#
+# The logic appears more complicated than it is since we are using regular expressions to
+# determine if an element is present in the list. For example the regex of the form:
+# /(^|[, ])\Qelement\E([, ]|$)/ determines that "element" is included in the given list
+# (see https://regex101.com/r/qeY0rm/2 for an interactive example).
+#
+# In fact the YAML above re-written as pseudocode would look like:
+#
+# ```
+# rules:
+#   - if ("1.0" ∈ julia && "linux" ∈ os && "x86_64" ∈ platform && CI_JOB_NAME ∉ excludes) || CI_JOB_NAME ∈ include
+# ```
+#
+# Note: Unfortunately we cannot use CI_JOB_NAME inside of the YAML regular expressions at
+# this time for `exclude` or `include`
+#
+# For additional details see:
+# https://docs.gitlab.com/ee/ci/yaml/#supported-onlyexcept-regexp-syntax
+# https://docs.gitlab.com/ee/ci/variables/README.html#environment-variables-expressions
+
+# Example of allowing failures:
+#
+# "1.0 (Linux, i686)":
+#   allow_failure: true
+#
+# "1.1 (Linux, i686)":
+#   allow_failure: true
+
+# The list of tags can be found here: https://gitlab.invenia.ca/infrastructure/EC2v2/blob/master/gitlab/runner/README.md#tags
+
+# Note: Including 64-bit/32-bit in the job titles will be removed in the future as it is redundant with the architecture
+# https://gitlab.invenia.ca/invenia/gitlab-ci-helper/-/issues/47
+
+# Using `rules` enables pipelines for merge requests (https://docs.gitlab.com/ee/ci/merge_request_pipelines/).
+# We'll disable this feature for now until we properly support it.
+workflow:
+  rules:
+    # Disable pipelines for merge requests
+    - if: $CI_MERGE_REQUEST_ID
+      when: never
+    - when: always

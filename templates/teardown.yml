@@ -1,0 +1,37 @@
+# Note: requires "hidden-jobs.yml" or "python.yml" to be included first
+
+# include:
+#   - local: /templates/coverage.yml
+
+"Coverage":
+  stage: teardown
+  except:
+    variables:
+      - $exclude =~ /(^|[, ])\Q"Coverage"\E([, ]|$)/
+  extends: .coverage
+
+"Documentation":
+  stage: teardown
+  except:
+    variables:
+      - $exclude =~ /(^|[, ])\Q"Documentation"\E([, ]|$)/
+  extends: .documentation
+  needs: [] # allows the job to start when the pipeline starts
+
+"Register":
+  stage: teardown
+  extends: .register
+  needs: [] # allows the job to start when the pipeline starts
+
+# Use the special job name "pages" to actually trigger deployment of the documentation.
+# https://docs.gitlab.com/ee/user/project/pages/getting_started_part_four.html#job
+pages:
+  stage: deploy
+  # Pages will only be deployed on master
+  only:
+    variables:
+      - $CI_DEFAULT_BRANCH == $CI_COMMIT_REF_NAME
+  dependencies:
+    - Documentation
+    - Coverage
+  extends: .pages

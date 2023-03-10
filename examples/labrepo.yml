@@ -1,0 +1,10 @@
+---
+include:
+  - project: invenia/gitlab-ci-helper
+    file: /templates/required-files.yml  # checks that each leaf directory contains required files
+  - project: invenia/gitlab-ci-helper
+    file: /templates/independent-experiments.yml  # checks that scripts are not sharing code between folders
+
+variables:
+  # If your project also needs a backrun script in each leaf directory it can be specified like:
+    required_files: "Project.toml Manifest.toml README.md backrun.jl"

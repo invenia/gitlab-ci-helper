@@ -1,0 +1,23 @@
+---
+# Note: An error occurs if you attempt to include the same file twice.
+# By including "ci-init.yml" here we're enforcing that end users don't mistakenly import
+# both "ci-init.yml" and "common-functions.yml".
+include:
+  - local: /templates/ci-init.yml
+
+variables:
+  common_functions:
+    |
+    echo 'Using "common_functions" is deprecated, use "ci_init" instead: ' >&2
+    echo '```' >&2
+    echo 'echo "$$ci_init" > ci_init && source ci_init && rm ci_init' >&2
+    echo '```' >&2
+
+    [[ $$allow_deprecations == "false" ]] && exit 1
+
+    if [ -n "$$ci_init" ]; then
+        echo "$$ci_init" > ci_init && source ci_init && rm ci_init
+    else
+        echo 'ERROR: "ci_init" is unexpectedly empty' >&2
+        exit 1
+    fi

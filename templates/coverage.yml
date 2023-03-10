@@ -1,0 +1,8 @@
+# Note: requires "hidden-jobs.yml" to be included first
+
+"Coverage":
+  stage: teardown
+  except:
+    variables:
+      - $exclude =~ /(^|[, ])\Q"Coverage"\E([, ]|$)/
+  extends: .coverage
